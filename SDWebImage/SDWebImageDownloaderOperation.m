@@ -53,7 +53,7 @@ typedef NSMutableDictionary<NSString *, id> SDCallbacksDictionary;
 
 @property (strong, nonatomic, nonnull) dispatch_semaphore_t callbacksLock; // a lock to keep the access to `callbackBlocks` thread-safe
 
-@property (strong, nonatomic, nonnull) dispatch_queue_t coderQueue; // the queue to do image decoding
+@property (strong, nonatomic, nonnull) NSOperationQueue *coderQueue; // the serial operation queue to do image decoding
 #if SD_UIKIT
 @property (assign, nonatomic) UIBackgroundTaskIdentifier backgroundTaskId;
 #endif
@@ -87,7 +87,8 @@ typedef NSMutableDictionary<NSString *, id> SDCallbacksDictionary;
         _expectedSize = 0;
         _unownedSession = session;
         _callbacksLock = dispatch_semaphore_create(1);
-        _coderQueue = dispatch_queue_create("com.hackemist.SDWebImageDownloaderOperationCoderQueue", DISPATCH_QUEUE_SERIAL);
+        _coderQueue = [NSOperationQueue new];
+        _coderQueue.maxConcurrentOperationCount = 1;
     }
     return self;
 }
@@ -356,20 +357,28 @@ didReceiveResponse:(NSURLResponse *)response
     self.previousProgress = currentProgress;
 
     if (self.options & SDWebImageDownloaderProgressiveLoad) {
-        // Get the image data
-        NSData *imageData = [self.imageData copy];
-        
-        // progressive decode the image in coder queue
-        dispatch_async(self.coderQueue, ^{
-            @autoreleasepool {
-                UIImage *image = SDImageLoaderDecodeProgressiveImageData(imageData, self.request.URL, finished, self, [[self class] imageOptionsFromDownloaderOptions:self.options], self.context);
-                if (image) {
-                    // We do not keep the progressive decoding image even when `finished`=YES. Because they are for view rendering but not take full function from downloader options. And some coders implementation may not keep consistent between progressive decoding and normal decoding.
-                    
-                    [self callCompletionBlocksWithImage:image imageData:nil error:nil finished:NO];
+        // keep maxmium one progressive decode process during download
+        if (self.coderQueue.operationCount == 0) {
+            [self.coderQueue addOperationWithBlock:^{
+                @autoreleasepool {
+                    // Get the image data
+                    NSData *imageData;
+                    @synchronized(self) {
+                        // Earily return if the downloaded finished
+                        if (!self.dataTask) {
+                            return;
+                        }
+                        imageData = [self.imageData copy];
+                    }
+                    UIImage *image = SDImageLoaderDecodeProgressiveImageData(imageData, self.request.URL, finished, self, [[self class] imageOptionsFromDownloaderOptions:self.options], self.context);
+                    if (image) {
+                        // We do not keep the progressive decoding image even when `finished`=YES. Because they are for view rendering but not take full function from downloader options. And some coders implementation may not keep consistent between progressive decoding and normal decoding.
+                        
+                        [self callCompletionBlocksWithImage:image imageData:nil error:nil finished:NO];
+                    }
                 }
-            }
-        });
+            }];
+        }
     }
     
     for (SDWebImageDownloaderProgressBlock progressBlock in [self callbacksForKey:kProgressCallbackKey]) {
@@ -428,8 +437,9 @@ didReceiveResponse:(NSURLResponse *)response
                     [self callCompletionBlocksWithError:self.responseError];
                     [self done];
                 } else {
-                    // decode the image in coder queue
-                    dispatch_async(self.coderQueue, ^{
+                    // decode the image in coder queue, cancel all previous decoding process
+                    [self.coderQueue cancelAllOperations];
+                    [self.coderQueue addOperationWithBlock:^{
                         @autoreleasepool {
                             UIImage *image = SDImageLoaderDecodeImageData(imageData, self.request.URL, [[self class] imageOptionsFromDownloaderOptions:self.options], self.context);
                             CGSize imageSize = image.size;
@@ -440,7 +450,7 @@ didReceiveResponse:(NSURLResponse *)response
                             }
                             [self done];
                         }
-                    });
+                    }];
                 }
             } else {
                 [self callCompletionBlocksWithError:[NSError errorWithDomain:SDWebImageErrorDomain code:SDWebImageErrorBadImageData userInfo:@{NSLocalizedDescriptionKey : @"Image data is nil"}]];
